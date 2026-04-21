@@ -2,18 +2,13 @@ import subprocess
 import sys
 import requests
 from bs4 import BeautifulSoup
-import json
 import time
-import urllib3
-import datetime
-from time import sleep
 
 # Constants
 EMAIL = ""
 PASSWORD = ""
 DUO_POLL_INTERVAL = 2  # seconds
 MAX_RETRIES = 3
-DEVICE_NAME = ""
 DEVICE_KEY = ""
 file_path = '/tmp/synacktoken'
 
@@ -81,196 +76,102 @@ def synack():
 
 
 
-    # Step 3: GET request to Duo Auth URL (Request 1 to DUO)
+    # Step 3: Navigate Duo OAuth entry — follow all redirects to the prompt page
     try:
         response = session.get(duo_auth_url, headers=custom_headers)
         if response.status_code != 200:
-            exit_on_error("Failed to GET Duo Auth URL")
-        session.cookies.update(response.cookies)  # Update cookie jar
+            exit_on_error("Failed to reach Duo prompt page")
+        session.cookies.update(response.cookies)
+        akey = response.url.split('/prompt/')[1].split('?')[0]
+        authkey = response.url.split('authkey=')[1].split('&')[0]
+        req_trace_group = response.url.split('req_trace_group=')[1].split('&')[0] if 'req_trace_group' in response.url else ''
+    except Exception as e:
+        exit_on_error(f"Error during Duo OAuth entry: {e}")
 
-        # Handle redirection
-        redirect_url = response.history[-1].headers['Location']
-        redirect_full_url = f"https://api-64d8e0cf.duosecurity.com{redirect_url}"
-        response = session.get(redirect_full_url, headers=custom_headers)
+    # Step 4: GET auth payload
+    try:
+        browser_features = '{"touch_supported":false,"platform_authenticator_status":"unavailable","webauthn_supported":true,"screen_resolution_height":1080,"screen_resolution_width":1920,"screen_color_depth":24,"is_uvpa_available":false,"client_capabilities_uvpa":false}'
+        api_headers = {**custom_headers, 'X-Duo-Req-Trace-Group': req_trace_group}
+        payload_url = f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/auth/payload?authkey={authkey}&browser_features={requests.utils.quote(browser_features)}'
+        response = session.get(payload_url, headers=api_headers)
         if response.status_code != 200:
-            exit_on_error("Failed to follow redirect URL")
-        session.cookies.update(response.cookies)  # Update cookie jar
-    except Exception as e:
-        exit_on_error(f"Error during Duo Auth process: {e}")
-
-    # Extract XSRF token from the script tag in the HTML response
-    try:
-        soup = BeautifulSoup(response.text, 'html.parser')
-        script_tag = soup.find('script', {'id': 'base-data'})
-        json_data = json.loads(script_tag.text)
-        xsrf_token = json_data['xsrf_token']
-    except Exception as e:
-        exit_on_error(f"Error extracting XSRF token: {e}")
-
-    # Extract 'sid' and 'tx' from URL
-    try:
-        sid = response.url.split('sid=')[1].split('&')[0]
-        tx = redirect_url.split('&tx=')[1].split('&')[0]
-    except Exception as e:
-        exit_on_error(f"Error extracting 'sid' and 'tx': {e}")
-    # Step 4: POST Request to Duo with XSRF Token and extracted data
-    try:
-        base_url = "https://api-64d8e0cf.duosecurity.com/frame/frameless/v4/auth"
-        post_url = f"{base_url}?sid={sid}&tx={tx}"
-        post_data = {
-        'tx': tx,
-        'parent': 'None',
-        '_xsrf': xsrf_token,
-        'java_version': '',
-        'flash_version': '',
-        'screen_resolution_width': '1920',
-        'screen_resolution_height': '1080',
-        'color_depth': '24',
-        'ch_ua_error': '',
-        'client_hints': '',
-        'is_cef_browser': 'false',
-        'is_ipad_os': 'false',
-        'is_ie_compatibility_mode': '',
-        'is_user_verifying_platform_authenticator_available': 'false',
-        'user_verifying_platform_authenticator_available_error': '',
-        'acting_ie_version': '',
-        'react_support': 'true',
-        'react_support_error_message': '',
-        }
-        cookies_header = {'Cookie': '; '.join([f'{name}={value}' for name, value in session.cookies.items()])}
-        response = session.post(post_url, data=post_data, headers={**custom_headers, **cookies_header})
-        if response.status_code != 200:
-            exit_on_error("Failed to POST data to Duo")
+            exit_on_error("Failed to GET auth payload")
         session.cookies.update(response.cookies)
     except Exception as e:
-        exit_on_error(f"Error during POST request to Duo: {e}")
+        exit_on_error(f"Error during auth payload: {e}")
 
-    # Step 5: Follow Redirects and Perform Health Check
+    # Step 5: Pre-auth initialization
     try:
-        health_check_urls = [
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/preauth/healthcheck?sid={sid}',
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/preauth/healthcheck/data?sid={sid}',
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/return?sid={sid}'
-        ]
-        for url in health_check_urls:
-            response = session.get(url)
-            if response.status_code != 200:
-                exit_on_error(f"Health check failed for URL: {url}")
-            session.cookies.update(response.cookies)
-    except Exception as e:
-        exit_on_error(f"Error during health check: {e}")
-
-    # Step 5.1: POST Request again to Duo with XSRF Token and extracted data
-    try:
-        base_url = "https://api-64d8e0cf.duosecurity.com/frame/frameless/v4/auth"
-        post_url = f"{base_url}?sid={sid}&tx={tx}"
-        post_data = {
-        'tx': tx,
-        'parent': 'None',
-        '_xsrf': xsrf_token,
-        'java_version': '',
-        'flash_version': '',
-        'screen_resolution_width': '1920',
-        'screen_resolution_height': '1080',
-        'color_depth': '24',
-        'ch_ua_error': '',
-        'client_hints': '',
-        'is_cef_browser': 'false',
-        'is_ipad_os': 'false',
-        'is_ie_compatibility_mode': '',
-        'is_user_verifying_platform_authenticator_available': 'false',
-        'user_verifying_platform_authenticator_available_error': '',
-        'acting_ie_version': '',
-        'react_support': 'true',
-        'react_support_error_message': '',
-        }
-        cookies_header = {'Cookie': '; '.join([f'{name}={value}' for name, value in session.cookies.items()])}
-        response = session.post(post_url, data=post_data, headers={**custom_headers, **cookies_header})
+        init_url = f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/pre_authn/initialization?authkey={authkey}&is_ipad=false'
+        response = session.get(init_url, headers=api_headers)
         if response.status_code != 200:
-            exit_on_error("Failed to POST data to Duo for step 5.1")
+            exit_on_error("Failed to GET pre-auth initialization")
         session.cookies.update(response.cookies)
     except Exception as e:
-        exit_on_error(f"Error during POST request to Duo: {e}")
+        exit_on_error(f"Error during pre-auth initialization: {e}")
 
-    # Step 6: Setup Device Prompt
+    # Step 6: Pre-auth evaluation — get available push devices
     try:
-        prompt_urls = [
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/auth/prompt?sid={sid}',
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/auth/prompt/data?sid={sid}'
-        ]
-        for url in prompt_urls:
-            response = session.get(url)
-            if response.status_code != 200:
-                exit_on_error(f"Failed to setup device prompt for URL: {url}")
+        eval_url = f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/pre_authn/evaluation?authkey={authkey}&browser_features={requests.utils.quote(browser_features)}&local_trust_choice=undecided'
+        response = session.get(eval_url, headers=api_headers)
+        if response.status_code != 200:
+            exit_on_error("Failed to GET pre-auth evaluation")
+        session.cookies.update(response.cookies)
+        factors = response.json()['response']['available_unified_auth_factors']['factors']
+        push_factors = [f for f in factors if f['factor_type'] == 'push']
+        if not push_factors:
+            exit_on_error("No push factors available")
+        pkey = DEVICE_KEY if DEVICE_KEY else push_factors[0]['device_info']['pkey']
     except Exception as e:
-        exit_on_error(f"Error during device prompt setup: {e}")
-    # Step 7: Sending POST to Duo for Device Selection and Duo Push
+        exit_on_error(f"Error during pre-auth evaluation: {e}")
+    # Step 7: Send Duo Push notification
     try:
-        prompt_url = 'https://api-64d8e0cf.duosecurity.com/frame/v4/prompt'
-        prompt_data = {
-            'device': DEVICE_NAME,  # Default device
-            'factor': 'Duo Push',
-            'postAuthDestination': 'OIDC_EXIT',
-            'browser_features': '{"touch_supported":false, "platform_authenticator_status":"unavailable", "webauthn_supported":true}',
-            'sid': sid
-        }
-        prompt_response = session.post(prompt_url, data=prompt_data)
-        if prompt_response.status_code != 200 or not is_json(prompt_response):
-            exit_on_error("Failed to send POST to Duo for device selection")
-        txid = prompt_response.json()['response']['txid']
-        subprocess.run(["python3","main.py"], check=True)
+        push_url = f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/auth/factors/push/auth'
+        push_response = session.post(push_url, json={'authkey': authkey, 'pkey': pkey}, headers=api_headers)
+        if push_response.status_code != 200 or not is_json(push_response):
+            exit_on_error("Failed to send Duo Push")
+        push_txid = push_response.json()['response']['push_txid']
+        subprocess.run(["python3", "main.py"], check=True)
     except Exception as e:
-        exit_on_error(f"Error during Duo device selection POST: {e}")
+        exit_on_error(f"Error sending Duo Push: {e}")
 
-    # Step 8: Polling for Duo Push Status
+    # Step 8: Poll for Duo Push approval
     try:
+        status_url = f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/auth/factors/push/status?authkey={authkey}&push_txid={push_txid}&saw_good_news=false'
         while True:
-            status_data = {'txid': txid, 'sid': sid}
-            status_response = session.post('https://api-64d8e0cf.duosecurity.com/frame/v4/status', data=status_data)
-            if not status_response.status_code == 200 or not is_json(status_response):
+            status_response = session.get(status_url, headers=api_headers)
+            if status_response.status_code != 200 or not is_json(status_response):
                 exit_on_error("Failed to poll Duo Push status")
-            status_response_data = status_response.json()
-
-            if status_response_data['response']['status_code'] == 'allow':
-                # print("Duo authentication successful.")
+            result = status_response.json()['response']['result']['result']
+            if result == 'SUCCESS':
+                session.cookies.update(status_response.cookies)
                 break
-            elif status_response_data['response']['status_code'] == 'timeout':
-                print("Device failed to respond.")
-                # Handling a timeout scenario without switching to a backup device.
-                # Additional actions can be added here.
-                break
-
+            elif result not in ('STATUS',):
+                exit_on_error(f"Duo Push failed with result: {result}")
             time.sleep(DUO_POLL_INTERVAL)
     except Exception as e:
-        exit_on_error(f"Error during polling for Duo Push status: {e}")
+        exit_on_error(f"Error polling Duo Push status: {e}")
 
 
-    # Step 9: Finalizing Authentication with Synack
+    # Step 9: Remember me + finalize auth to get OIDC exit URL
     try:
-        final_auth_url = 'https://api-64d8e0cf.duosecurity.com/frame/v4/oidc/exit'
-        final_auth_data = {
-            'sid': sid,
-            'txid': txid,
-            'factor': 'Duo Push',
-            'device_key': DEVICE_KEY,
-            '_xsrf': xsrf_token,
-            'dampen_choice': 'false'
-        }
-        final_auth_response = session.post(final_auth_url, data=final_auth_data)
-        if final_auth_response.status_code != 200:
-            exit_on_error("Failed to finalize authentication with Synack")
-        #print("URL:", final_auth_response.url)
+        session.post(f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/auth/remember_me',
+                     json={'authkey': authkey}, headers=api_headers)
+        finalize_response = session.get(f'https://api-64d8e0cf.duosecurity.com/prompt/{akey}/auth/finalize_auth?authkey={authkey}',
+                                        headers=api_headers)
+        if finalize_response.status_code != 200 or not is_json(finalize_response):
+            exit_on_error("Failed to finalize Duo auth")
+        oidc_exit_url = finalize_response.json()['response']['url']
     except Exception as e:
-        exit_on_error(f"Error during final authentication with Synack: {e}")
+        exit_on_error(f"Error during finalize auth: {e}")
 
 
-    # Step 10: Final Redirect to Synack with Grant Token
+    # Step 10: Follow OIDC exit redirect chain to Synack grant token
     try:
-        final_response = session.get(final_auth_response.url)
+        final_response = session.get(oidc_exit_url, headers=custom_headers)
         if final_response.status_code != 200:
             exit_on_error("Failed during final redirect to Synack")
-        grant_token = final_response.url.split('grant_token=')[1]
-        #print("Login process complete. Grant Token:", grant_token)
+        grant_token = final_response.url.split('grant_token=')[1].split('&')[0]
     except Exception as e:
         exit_on_error(f"Error during final redirect: {e}")
 

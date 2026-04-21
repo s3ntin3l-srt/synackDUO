@@ -45,10 +45,10 @@ python3 synconnect.py
 ### Initial Setup
 1. After setting up ruo, capture the login process with Burp Suite.
 2. Locate the `/frame/v4/auth/prompt/data` request and note down the index and key from its response.
-3. Update `synconnect_cli.py` with your credentials on lines 12 and 13.
-4. Set the `index` (e.g., `phone2`) on line 16 and `key` (e.g., `DPXXXXXXXXXX`) on line 17.
+3. Update `synconnect_cli.py` with your credentials on lines 8 and 9.
+4. Set the `DEVICE_KEY` (e.g., `DPXXXXXXXXXX`) on line 11. If left blank, the first available push device is used.
 5. (Optional) Customize Token Storage Location
-   - To save the token in a different location, modify the `file_path` on line 18.
+   - To save the token in a different location, modify the `file_path` on line 13.
    - By default, the token is stored in `/tmp/synacktoken`.
 
 ### Running the Script
