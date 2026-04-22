@@ -1,21 +1,33 @@
+import base64
+import json
 import subprocess
 import sys
+import time
+from urllib.parse import parse_qs, urlparse
 import requests
 from bs4 import BeautifulSoup
-import json
-import time
-import urllib3
-import datetime
-from time import sleep
 
 # Constants
 EMAIL = ""
 PASSWORD = ""
 DUO_POLL_INTERVAL = 2  # seconds
 MAX_RETRIES = 3
-DEVICE_NAME = ""
-DEVICE_KEY = ""
+PRIMARY_PKEY = "DPxxxx" # Refer README for more info
+FALLBACK_PKEY = "DPxxxx" # Refer README for more info
 file_path = '/tmp/synacktoken'
+
+BROWSER_FEATURES = (
+    '{"touch_supported":false,"platform_authenticator_status":"unavailable",'
+    '"webauthn_supported":true,"screen_resolution_height":1112,'
+    '"screen_resolution_width":1710,"screen_color_depth":30,'
+    '"is_uvpa_available":false,"client_capabilities_uvpa":false}'
+)
+CLIENT_HINTS = base64.b64encode(json.dumps({
+    "brands": [{"brand": "Not-A.Brand", "version": "24"},
+               {"brand": "Chromium", "version": "146"}],
+    "fullVersionList": [], "mobile": False,
+    "platform": "macOS", "platformVersion": "", "uaFullVersion": "",
+}).encode()).decode()
 
 
 def synack():
@@ -26,21 +38,22 @@ def synack():
         except ValueError:
             return False
 
-    # Function to exit on error with a message
     def exit_on_error(message):
         print(message)
         sys.exit(1)
 
-    # Initialize a session with a cookie jar
     session = requests.Session()
     session.cookies = requests.cookies.RequestsCookieJar()
 
-    # Custom headers
     custom_headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/146.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://login.synack.com/",
     }
 
     # Step 1: GET request to login.synack.com to fetch CSRF token
@@ -54,232 +67,164 @@ def synack():
         exit_on_error(f"Error during fetching CSRF token: {e}")
 
     # Step 2: POST request to /api/authenticate with credentials
+    duo_auth_url = None
     for attempt in range(MAX_RETRIES):
         try:
-            login_url = 'https://login.synack.com/api/authenticate'
-            login_data = {"email": EMAIL, "password": PASSWORD}
-            headers = {'X-Csrf-Token': csrf_token}
-            response = session.post(login_url, json=login_data, headers=headers)
-            
+            response = session.post(
+                'https://login.synack.com/api/authenticate',
+                json={"email": EMAIL, "password": PASSWORD},
+                headers={'X-Csrf-Token': csrf_token},
+            )
             if response.status_code == 200 and is_json(response):
-                response_data = response.json()
-                duo_auth_url = response_data.get('duo_auth_url')
+                duo_auth_url = response.json().get('duo_auth_url')
                 if duo_auth_url:
-                    print("[!] Login successful on attempt {}".format(attempt + 1))
-                    break  # Successful login, break out of the loop
-                else:
-                    exit_on_error("Duo Auth URL missing in response")
+                    print(f"[!] Login successful on attempt {attempt + 1}")
+                    break
+                exit_on_error("Duo Auth URL missing in response")
             else:
-                print(f"Login attempt {attempt + 1} failed, status code: {response.status_code}, retrying...")
+                print(f"Login attempt {attempt + 1} failed, status code: "
+                      f"{response.status_code}, retrying...")
                 if attempt == MAX_RETRIES - 1:
                     exit_on_error("Login failed after maximum retries")
-
         except Exception as e:
             print(f"Login attempt {attempt + 1} failed with error: {e}")
             if attempt == MAX_RETRIES - 1:
-                exit_on_error("Error during login after maximum retries: {e}")
+                exit_on_error(f"Error during login after maximum retries: {e}")
 
-
-
-    # Step 3: GET request to Duo Auth URL (Request 1 to DUO)
+    # Step 3: Follow OAuth → Duo prompt; extract akey / authkey / duo_base
     try:
-        response = session.get(duo_auth_url, headers=custom_headers)
+        response = session.get(duo_auth_url, headers=custom_headers,
+                               allow_redirects=True)
         if response.status_code != 200:
-            exit_on_error("Failed to GET Duo Auth URL")
-        session.cookies.update(response.cookies)  # Update cookie jar
-
-        # Handle redirection
-        redirect_url = response.history[-1].headers['Location']
-        redirect_full_url = f"https://api-64d8e0cf.duosecurity.com{redirect_url}"
-        response = session.get(redirect_full_url, headers=custom_headers)
-        if response.status_code != 200:
-            exit_on_error("Failed to follow redirect URL")
-        session.cookies.update(response.cookies)  # Update cookie jar
+            exit_on_error(f"Duo redirect chain failed: {response.status_code}")
+        parsed = urlparse(response.url)
+        duo_base = f"{parsed.scheme}://{parsed.netloc}"
+        if '/prompt/' not in parsed.path:
+            exit_on_error(f"Unexpected Duo landing URL: {response.url}")
+        akey = parsed.path.split('/prompt/')[1].split('/')[0]
+        qs = parse_qs(parsed.query)
+        authkey = qs.get('authkey', [None])[0]
+        trace_id = qs.get('req_trace_group', [''])[0]
+        if not authkey:
+            exit_on_error("authkey missing from Duo prompt URL")
     except Exception as e:
-        exit_on_error(f"Error during Duo Auth process: {e}")
+        exit_on_error(f"Error during Duo redirect/extract: {e}")
 
-    # Extract XSRF token from the script tag in the HTML response
-    try:
-        soup = BeautifulSoup(response.text, 'html.parser')
-        script_tag = soup.find('script', {'id': 'base-data'})
-        json_data = json.loads(script_tag.text)
-        xsrf_token = json_data['xsrf_token']
-    except Exception as e:
-        exit_on_error(f"Error extracting XSRF token: {e}")
+    duo_headers = {
+        **custom_headers,
+        "Origin": duo_base,
+        "Referer": f"{duo_base}/prompt/{akey}?authkey={authkey}"
+                   f"&req_trace_group={trace_id}",
+        "X-Duo-Req-Trace-Group": trace_id,
+    }
 
-    # Extract 'sid' and 'tx' from URL
+    # Step 4: Pre-auth (payload → initialization → evaluation)
     try:
-        sid = response.url.split('sid=')[1].split('&')[0]
-        tx = redirect_url.split('&tx=')[1].split('&')[0]
-    except Exception as e:
-        exit_on_error(f"Error extracting 'sid' and 'tx': {e}")
-    # Step 4: POST Request to Duo with XSRF Token and extracted data
-    try:
-        base_url = "https://api-64d8e0cf.duosecurity.com/frame/frameless/v4/auth"
-        post_url = f"{base_url}?sid={sid}&tx={tx}"
-        post_data = {
-        'tx': tx,
-        'parent': 'None',
-        '_xsrf': xsrf_token,
-        'java_version': '',
-        'flash_version': '',
-        'screen_resolution_width': '1920',
-        'screen_resolution_height': '1080',
-        'color_depth': '24',
-        'ch_ua_error': '',
-        'client_hints': '',
-        'is_cef_browser': 'false',
-        'is_ipad_os': 'false',
-        'is_ie_compatibility_mode': '',
-        'is_user_verifying_platform_authenticator_available': 'false',
-        'user_verifying_platform_authenticator_available_error': '',
-        'acting_ie_version': '',
-        'react_support': 'true',
-        'react_support_error_message': '',
+        session.get(
+            f"{duo_base}/prompt/{akey}/auth/payload",
+            params={'authkey': authkey, 'browser_features': BROWSER_FEATURES},
+            headers=duo_headers,
+        )
+        session.get(
+            f"{duo_base}/prompt/{akey}/pre_authn/initialization",
+            params={'authkey': authkey, 'is_ipad': 'false',
+                    'client_hints': CLIENT_HINTS},
+            headers=duo_headers,
+        )
+        response = session.get(
+            f"{duo_base}/prompt/{akey}/pre_authn/evaluation",
+            params={'authkey': authkey, 'browser_features': BROWSER_FEATURES,
+                    'local_trust_choice': 'undecided'},
+            headers=duo_headers,
+        )
+        if not is_json(response):
+            exit_on_error("pre_authn/evaluation returned non-JSON")
+        enrolled = {
+            f['device_info']['pkey']
+            for f in response.json()['response']
+                          ['available_unified_auth_factors']['factors']
+            if f.get('factor_type') == 'push'
         }
-        cookies_header = {'Cookie': '; '.join([f'{name}={value}' for name, value in session.cookies.items()])}
-        response = session.post(post_url, data=post_data, headers={**custom_headers, **cookies_header})
-        if response.status_code != 200:
-            exit_on_error("Failed to POST data to Duo")
-        session.cookies.update(response.cookies)
     except Exception as e:
-        exit_on_error(f"Error during POST request to Duo: {e}")
+        exit_on_error(f"Error during Duo pre-auth: {e}")
 
-    # Step 5: Follow Redirects and Perform Health Check
+    # Step 5: POST Duo push and poll, with fallback
+    def trigger_push(pkey):
+        r = session.post(
+            f"{duo_base}/prompt/{akey}/auth/factors/push/auth",
+            json={'authkey': authkey, 'pkey': pkey},
+            headers={**duo_headers, "Content-Type": "application/json"},
+        )
+        if r.status_code != 200 or not is_json(r):
+            exit_on_error(f"push/auth failed: {r.status_code} {r.text[:200]}")
+        return r.json()['response']['push_txid']
+
+    primary_pkey = (PRIMARY_PKEY if PRIMARY_PKEY in enrolled
+                    else next(iter(enrolled)))
+    fallback_pkey = (FALLBACK_PKEY
+                     if FALLBACK_PKEY in enrolled
+                     and FALLBACK_PKEY != primary_pkey
+                     else None)
+
+    def run_push_and_poll(pkey):
+        txid = trigger_push(pkey)
+        subprocess.run(["python3", "main.py"], check=True)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            r = session.get(
+                f"{duo_base}/prompt/{akey}/auth/factors/push/status",
+                params={'authkey': authkey, 'push_txid': txid,
+                        'saw_good_news': 'false'},
+                headers=duo_headers,
+            )
+            if r.status_code != 200 or not is_json(r):
+                exit_on_error(f"push/status failed: {r.status_code} {r.text[:200]}")
+            result = r.json()['response']['result']['result']
+            if result == 'SUCCESS':
+                return True
+            if result == 'STATUS':
+                time.sleep(DUO_POLL_INTERVAL)
+                continue
+            return False
+        return False
+
     try:
-        health_check_urls = [
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/preauth/healthcheck?sid={sid}',
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/preauth/healthcheck/data?sid={sid}',
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/return?sid={sid}'
-        ]
-        for url in health_check_urls:
-            response = session.get(url)
-            if response.status_code != 200:
-                exit_on_error(f"Health check failed for URL: {url}")
-            session.cookies.update(response.cookies)
+        ok = run_push_and_poll(primary_pkey)
+        if not ok and fallback_pkey:
+            print("Primary device did not approve. Trying fallback Android.")
+            ok = run_push_and_poll(fallback_pkey)
+        if not ok:
+            exit_on_error("All Duo push attempts failed/timed out.")
     except Exception as e:
-        exit_on_error(f"Error during health check: {e}")
+        exit_on_error(f"Error during push/poll: {e}")
 
-    # Step 5.1: POST Request again to Duo with XSRF Token and extracted data
+    # Step 6: Finalize auth → follow redirects → grant_token
     try:
-        base_url = "https://api-64d8e0cf.duosecurity.com/frame/frameless/v4/auth"
-        post_url = f"{base_url}?sid={sid}&tx={tx}"
-        post_data = {
-        'tx': tx,
-        'parent': 'None',
-        '_xsrf': xsrf_token,
-        'java_version': '',
-        'flash_version': '',
-        'screen_resolution_width': '1920',
-        'screen_resolution_height': '1080',
-        'color_depth': '24',
-        'ch_ua_error': '',
-        'client_hints': '',
-        'is_cef_browser': 'false',
-        'is_ipad_os': 'false',
-        'is_ie_compatibility_mode': '',
-        'is_user_verifying_platform_authenticator_available': 'false',
-        'user_verifying_platform_authenticator_available_error': '',
-        'acting_ie_version': '',
-        'react_support': 'true',
-        'react_support_error_message': '',
-        }
-        cookies_header = {'Cookie': '; '.join([f'{name}={value}' for name, value in session.cookies.items()])}
-        response = session.post(post_url, data=post_data, headers={**custom_headers, **cookies_header})
-        if response.status_code != 200:
-            exit_on_error("Failed to POST data to Duo for step 5.1")
-        session.cookies.update(response.cookies)
+        response = session.get(
+            f"{duo_base}/prompt/{akey}/auth/finalize_auth",
+            params={'authkey': authkey}, headers=duo_headers,
+        )
+        if not is_json(response):
+            exit_on_error("finalize_auth returned non-JSON")
+        exit_url = response.json()['response']['url']
+
+        response = session.get(exit_url, headers=custom_headers,
+                               allow_redirects=True)
+        if 'grant_token=' not in response.url:
+            exit_on_error(f"grant_token missing from final URL: {response.url}")
+        grant_token = response.url.split('grant_token=')[1].split('&')[0]
     except Exception as e:
-        exit_on_error(f"Error during POST request to Duo: {e}")
+        exit_on_error(f"Error during Duo finalize/redirect: {e}")
 
-    # Step 6: Setup Device Prompt
-    try:
-        prompt_urls = [
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/auth/prompt?sid={sid}',
-            f'https://api-64d8e0cf.duosecurity.com/frame/v4/auth/prompt/data?sid={sid}'
-        ]
-        for url in prompt_urls:
-            response = session.get(url)
-            if response.status_code != 200:
-                exit_on_error(f"Failed to setup device prompt for URL: {url}")
-    except Exception as e:
-        exit_on_error(f"Error during device prompt setup: {e}")
-    # Step 7: Sending POST to Duo for Device Selection and Duo Push
-    try:
-        prompt_url = 'https://api-64d8e0cf.duosecurity.com/frame/v4/prompt'
-        prompt_data = {
-            'device': DEVICE_NAME,  # Default device
-            'factor': 'Duo Push',
-            'postAuthDestination': 'OIDC_EXIT',
-            'browser_features': '{"touch_supported":false, "platform_authenticator_status":"unavailable", "webauthn_supported":true}',
-            'sid': sid
-        }
-        prompt_response = session.post(prompt_url, data=prompt_data)
-        if prompt_response.status_code != 200 or not is_json(prompt_response):
-            exit_on_error("Failed to send POST to Duo for device selection")
-        txid = prompt_response.json()['response']['txid']
-        subprocess.run(["python3","main.py"], check=True)
-    except Exception as e:
-        exit_on_error(f"Error during Duo device selection POST: {e}")
-
-    # Step 8: Polling for Duo Push Status
-    try:
-        while True:
-            status_data = {'txid': txid, 'sid': sid}
-            status_response = session.post('https://api-64d8e0cf.duosecurity.com/frame/v4/status', data=status_data)
-            if not status_response.status_code == 200 or not is_json(status_response):
-                exit_on_error("Failed to poll Duo Push status")
-            status_response_data = status_response.json()
-
-            if status_response_data['response']['status_code'] == 'allow':
-                # print("Duo authentication successful.")
-                break
-            elif status_response_data['response']['status_code'] == 'timeout':
-                print("Device failed to respond.")
-                # Handling a timeout scenario without switching to a backup device.
-                # Additional actions can be added here.
-                break
-
-            time.sleep(DUO_POLL_INTERVAL)
-    except Exception as e:
-        exit_on_error(f"Error during polling for Duo Push status: {e}")
-
-
-    # Step 9: Finalizing Authentication with Synack
-    try:
-        final_auth_url = 'https://api-64d8e0cf.duosecurity.com/frame/v4/oidc/exit'
-        final_auth_data = {
-            'sid': sid,
-            'txid': txid,
-            'factor': 'Duo Push',
-            'device_key': DEVICE_KEY,
-            '_xsrf': xsrf_token,
-            'dampen_choice': 'false'
-        }
-        final_auth_response = session.post(final_auth_url, data=final_auth_data)
-        if final_auth_response.status_code != 200:
-            exit_on_error("Failed to finalize authentication with Synack")
-        #print("URL:", final_auth_response.url)
-    except Exception as e:
-        exit_on_error(f"Error during final authentication with Synack: {e}")
-
-
-    # Step 10: Final Redirect to Synack with Grant Token
-    try:
-        final_response = session.get(final_auth_response.url)
-        if final_response.status_code != 200:
-            exit_on_error("Failed during final redirect to Synack")
-        grant_token = final_response.url.split('grant_token=')[1]
-        #print("Login process complete. Grant Token:", grant_token)
-    except Exception as e:
-        exit_on_error(f"Error during final redirect: {e}")
-
-    # Step 11: GET request to /token?grant_token= to receive access_token
-    headers['X-Requested-With'] = 'XMLHttpRequest'
-    response = requests.get(f'https://platform.synack.com/token?grant_token={grant_token}', headers=headers)
-    #print("Text:", response.text)
+    # Step 7: GET request to /token?grant_token= to receive access_token
+    headers = {**custom_headers, 'X-Requested-With': 'XMLHttpRequest'}
+    response = requests.get(
+        f'https://platform.synack.com/token?grant_token={grant_token}',
+        headers=headers,
+    )
     access_token = response.json().get('access_token') if is_json(response) else None
     return access_token
+
 
 def write_token_to_file(token, file_path):
     try:
