@@ -42,14 +42,43 @@ python3 synconnect.py
 ```
 
 ## Using synconnect_cli (Requests-based token generation)
-### Initial Setup
-1. After setting up ruo, capture the login process with Burp Suite.
-2. Locate the `/frame/v4/auth/prompt/data` request and note down the index and key from its response.
-3. Update `synconnect_cli.py` with your credentials on lines 12 and 13.
-4. Set the `index` (e.g., `phone2`) on line 16 and `key` (e.g., `DPXXXXXXXXXX`) on line 17.
-5. (Optional) Customize Token Storage Location
-   - To save the token in a different location, modify the `file_path` on line 18.
-   - By default, the token is stored in `/tmp/synacktoken`.
+### Configuring device pkeys
+
+The two pkey constants in the script — `PRIMARY_PKEY` and `FALLBACK_PKEY` — need to be set to the Duo device keys enrolled on your account. These values are **account-specific** and will not match the placeholders.
+
+### How to find your pkeys
+
+Duo exposes the full list of enrolled push devices at:
+
+```
+GET https://api-<subdomain>.duosecurity.com/prompt/<AKEY>/pre_authn/evaluation?authkey=<AUTHKEY>&browser_features=<...>&local_trust_choice=undecided
+```
+
+This call is made automatically during a normal browser login. To capture it:
+
+1. Start an intercepting proxy (Burp, mitmproxy, etc.) with your browser routed through it.
+2. Log in to Synack normally — Duo will show the push prompt.
+3. In your proxy's history, find the request to `/pre_authn/evaluation`.
+4. Inspect the JSON response body. Look for `response.available_unified_auth_factors.factors` — each push-capable device appears as:
+
+   ```json
+   {
+     "factor_type": "push",
+     "device_info": {
+       "pkey": "DPxxxxxxxxxxxxxxxxxx",
+       "name": "Android"
+     }
+   }
+   ```
+
+Copy the `pkey` values for your devices.
+
+### Which pkey goes where
+
+- **`PRIMARY_PKEY`** — set this to your **auto-approver device** (the one `main.py` taps "Approve" on automatically). This is the device the script will push to first.
+- **`FALLBACK_PKEY`** — set this to your **personal device** (your regular phone). If the primary push doesn't get approved within the timeout, the script falls back to this one and you can approve manually.
+
+If you only have one push device enrolled, leave `FALLBACK_PKEY` set to the same value as primary or to any string — the fallback simply won't trigger.
 
 ### Running the Script
 Execute using Python:
